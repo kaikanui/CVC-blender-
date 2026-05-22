@@ -444,21 +444,23 @@ export default function PhonicsGameBoard() {
                       </span>
                     </div>
 
-                    {/* Word text with beautiful letter highlighting */}
-                    <span className="text-xs font-black text-[#3d405b] uppercase mt-1 tracking-wide">
-                      {level === 'first-sound' ? (
-                        <>
-                          <span className="text-[#e07a5f] font-extrabold decoration-[#e07a5f] underline underline-offset-2">
-                            {choice.word[0]}
-                          </span>
-                          <span>
-                            {choice.word.slice(1)}
-                          </span>
-                        </>
-                      ) : (
-                        choice.word
-                      )}
-                    </span>
+                    {/* Word text with beautiful letter highlighting - only for heart words */}
+                    {choice.category === 'heart' && (
+                      <span className="text-xs font-black text-[#3d405b] uppercase mt-1 tracking-wide">
+                        {level === 'first-sound' ? (
+                          <>
+                            <span className="text-[#e07a5f] font-extrabold decoration-[#e07a5f] underline underline-offset-2">
+                              {choice.word[0]}
+                            </span>
+                            <span>
+                              {choice.word.slice(1)}
+                            </span>
+                          </>
+                        ) : (
+                          choice.word
+                        )}
+                      </span>
+                    )}
 
                     {/* Badge checkers absolute */}
                     {isSelected && matchState === 'correct' && (
