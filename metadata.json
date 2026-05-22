@@ -1,0 +1,10 @@
+{
+  "name": "Remix: Remix: Phonics Word Matcher",
+  "description": "An interactive hand-tracking educational game helping children read CVC, CCVC, CVCC, and digraph words by matching words to images using their camera sensor.",
+  "requestFramePermissions": [
+    "camera"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
