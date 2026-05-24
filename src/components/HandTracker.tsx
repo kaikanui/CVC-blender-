@@ -40,12 +40,45 @@ export default function HandTracker({
   const wasCorrectRef = useRef(false);
   const unlockTimerRef = useRef<NodeJS.Timeout | null>(null);
 
-  // Floating coordinates for the UI dot (smoothed)
-  const [dotPos, setDotPos] = useState({ x: window.innerWidth / 2, y: window.innerHeight / 2 });
+  // Cache choice card rectangles to completely avoid forced synchronous layouts (getBoundingClientRect on every render frame)
+  const cardRectsRef = useRef<{ left: number; right: number; top: number; bottom: number; index: number }[]>([]);
+
+  // Refs for hardware-accelerated direct DOM tracking to isolate cursor movement from React updates
+  const cursorRef = useRef<HTMLDivElement | null>(null);
+  const progressRingRef = useRef<SVGCircleElement | null>(null);
+
   const [isDwellActive, setIsDwellActive] = useState(false);
   const [hoveredCardIndex, setHoveredCardIndex] = useState<number | null>(null);
   const [dwellProgress, setDwellProgress] = useState(0); // 0 to 100
   const lastDwellProgressRef = useRef(0);
+
+  // Smoothly update the cursor's style utilizing translate3d GPU-composited layers
+  const updateCursorStyle = (x: number, y: number, activeDwell: boolean) => {
+    if (cursorRef.current) {
+      cursorRef.current.style.transform = `translate3d(${x - 20}px, ${y - 20}px, 0) scale(${activeDwell ? 1.15 : 1})`;
+    }
+  };
+
+  // Synchronize cursor scale when dwell state changes
+  useEffect(() => {
+    updateCursorStyle(dotRef.current.x, dotRef.current.y, isDwellActive);
+  }, [isDwellActive]);
+
+  // Clear cached rectangles when choices count or correctness state changes (indicating a game reload)
+  useEffect(() => {
+    cardRectsRef.current = [];
+  }, [choicesCount, isCorrect]);
+
+  // Handle window resizing to invalidate layouts cache
+  useEffect(() => {
+    const handleResize = () => {
+      cardRectsRef.current = [];
+    };
+    window.addEventListener('resize', handleResize);
+    return () => {
+      window.removeEventListener('resize', handleResize);
+    };
+  }, []);
 
   // Reset the tracking dot back to the center of the screen when correct answer is achieved
   // and keep it locked there until 2 seconds after the new word pops up
@@ -55,7 +88,7 @@ export default function HandTracker({
 
     if (isCorrect) {
       dotRef.current = { x: midX, y: midY };
-      setDotPos({ x: midX, y: midY });
+      updateCursorStyle(midX, midY, isDwellActive);
       
       // Lock movement immediately
       isMovementLockedRef.current = true;
@@ -72,7 +105,7 @@ export default function HandTracker({
         wasCorrectRef.current = false;
         isMovementLockedRef.current = true;
         dotRef.current = { x: midX, y: midY };
-        setDotPos({ x: midX, y: midY });
+        updateCursorStyle(midX, midY, isDwellActive);
 
         if (unlockTimerRef.current) {
           clearTimeout(unlockTimerRef.current);
@@ -94,6 +127,7 @@ export default function HandTracker({
       }
     };
   }, []);
+
   const [mediaPipeStatus, setMediaPipeStatus] = useState<'unloaded' | 'loading' | 'ready' | 'failed'>('unloaded');
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [hasCameraAccess, setHasCameraAccess] = useState<boolean | null>(null);
@@ -108,10 +142,8 @@ export default function HandTracker({
   const requestRef = useRef<number | null>(null);
   const hoverStartTimeRef = useRef<number | null>(null);
   const currentHoveredIndexRef = useRef<number | null>(null);
-  const cameraUtilsLoadedRef = useRef(false);
   const handsClassLoadedRef = useRef(false);
   const mpInstanceRef = useRef<any>(null);
-  const mpCameraRef = useRef<any>(null);
 
   // Dwell parameters
   const DWELL_DURATION = 1250; // 1.25 seconds standard dwell
@@ -132,18 +164,14 @@ export default function HandTracker({
     });
   };
 
-  // Initialize MediaPipe Script Loading
+  // Initialize MediaPipe Script Loading - Loads hands.js exclusively, skipping camera_utils.js to optimize bandwidth
   const initMediaPipeScripts = async () => {
     if (mediaPipeStatus === 'loading' || mediaPipeStatus === 'ready') return;
     
     setMediaPipeStatus('loading');
     setErrorMessage(null);
     try {
-      // 1. Load Camera Utils CDN
-      await loadScript('https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js');
-      cameraUtilsLoadedRef.current = true;
-      
-      // 2. Load Hands CDN
+      // Load Hands CDN
       await loadScript('https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js');
       handsClassLoadedRef.current = true;
       
@@ -179,8 +207,9 @@ export default function HandTracker({
       const stream = await navigator.mediaDevices.getUserMedia({
         video: {
           facingMode: 'user',
-          width: { ideal: 640 },
-          height: { ideal: 480 },
+          width: { ideal: 480, max: 640 },
+          height: { ideal: 360, max: 480 },
+          frameRate: { ideal: 15, max: 20 } // Classroom-iPad-safe frame rate to minimize processor workload
         },
         audio: false,
       });
@@ -207,12 +236,6 @@ export default function HandTracker({
       cancelAnimationFrame(requestRef.current);
       requestRef.current = null;
     }
-    if (mpCameraRef.current) {
-      try {
-        mpCameraRef.current.stop();
-      } catch (e) {}
-      mpCameraRef.current = null;
-    }
     if (streamRef.current) {
       streamRef.current.getTracks().forEach((track) => track.stop());
       streamRef.current = null;
@@ -229,6 +252,9 @@ export default function HandTracker({
   useEffect(() => {
     if (cameraActive && trackingMode === 'finger' && mediaPipeStatus === 'ready' && videoRef.current) {
       let isStopped = false;
+      let isProcessing = false;
+      let lastProcessTime = 0;
+      let animationFrameId: number | null = null;
       
       try {
         const mpHands = (window as any).Hands;
@@ -245,17 +271,17 @@ export default function HandTracker({
 
         hands.setOptions({
           maxNumHands: 1,
-          modelComplexity: 1,
-          minDetectionConfidence: 0.55,
-          minTrackingConfidence: 0.55
+          modelComplexity: 0, // 0 for ultra-lightweight detection model, running flawlessly on iPad 6th generation
+          minDetectionConfidence: 0.50,
+          minTrackingConfidence: 0.50
         });
 
         hands.onResults((results: any) => {
           if (isStopped) return;
           
           if (isMovementLockedRef.current) {
-            // Keep at center, do not process updates, but maintain idle feedback
             dotRef.current = { x: window.innerWidth / 2, y: window.innerHeight / 2 };
+            updateCursorStyle(dotRef.current.x, dotRef.current.y, isDwellActive);
             setActiveMotionLevel(prev => Math.max(0, prev * 0.7));
             return;
           }
@@ -272,11 +298,11 @@ export default function HandTracker({
             const targetY = Math.max(0, Math.min(window.innerHeight, py));
             
             dotRef.current = {
-              x: dotRef.current.x * 0.7 + targetX * 0.3,
-              y: dotRef.current.y * 0.7 + targetY * 0.3,
+              x: dotRef.current.x * 0.75 + targetX * 0.25,
+              y: dotRef.current.y * 0.75 + targetY * 0.25,
             };
             
-            setDotPos({ ...dotRef.current });
+            updateCursorStyle(dotRef.current.x, dotRef.current.y, isDwellActive);
             setActiveMotionLevel(100); // Visual signal of tracking
           } else {
             // Decaying signal if hand was lost
@@ -286,19 +312,29 @@ export default function HandTracker({
 
         mpInstanceRef.current = hands;
 
-        const mpCameraCls = (window as any).Camera;
-        if (mpCameraCls) {
-          const camera = new mpCameraCls(videoRef.current, {
-            onFrame: async () => {
-              if (isStopped) return;
-              await hands.send({ image: videoRef.current! });
-            },
-            width: 640,
-            height: 480
-          });
-          camera.start();
-          mpCameraRef.current = camera;
-        }
+        // Efficient, throttled animationFrame processing to prevent CPU/Safari thermal choking
+        const sendThrottledFrame = async () => {
+          if (isStopped) return;
+
+          const now = performance.now();
+          // Throttle detection frequency to an iPad-friendly ~7-8 frames per second (130ms spacing)
+          const isTimeElapsed = now - lastProcessTime >= 130;
+
+          if (isTimeElapsed && !isProcessing && videoRef.current && videoRef.current.readyState >= 2) {
+            isProcessing = true;
+            try {
+              await hands.send({ image: videoRef.current });
+            } catch (err) {
+              console.warn('Hands detection run error:', err);
+            }
+            isProcessing = false;
+            lastProcessTime = now;
+          }
+
+          animationFrameId = requestAnimationFrame(sendThrottledFrame);
+        };
+
+        sendThrottledFrame();
 
       } catch (e: any) {
         console.warn('Error configuring MediaPipe hands, using Hover Mode fallback:', e);
@@ -307,6 +343,9 @@ export default function HandTracker({
 
       return () => {
         isStopped = true;
+        if (animationFrameId) {
+          cancelAnimationFrame(animationFrameId);
+        }
         if (mpInstanceRef.current) {
           try {
             mpInstanceRef.current.close();
@@ -315,7 +354,7 @@ export default function HandTracker({
         }
       };
     }
-  }, [cameraActive, trackingMode, mediaPipeStatus]);
+  }, [cameraActive, trackingMode, mediaPipeStatus, isDwellActive]);
 
   // Main custom motion tracking & intersection check loop
   useEffect(() => {
@@ -354,7 +393,7 @@ export default function HandTracker({
     if (isMovementLockedRef.current) return;
     if (trackingMode === 'touch') {
       dotRef.current = { x: e.clientX, y: e.clientY };
-      setDotPos({ x: e.clientX, y: e.clientY });
+      updateCursorStyle(e.clientX, e.clientY, isDwellActive);
     }
   };
 
@@ -363,7 +402,7 @@ export default function HandTracker({
     if (trackingMode === 'touch' && e.touches.length > 0) {
       const touch = e.touches[0];
       dotRef.current = { x: touch.clientX, y: touch.clientY };
-      setDotPos({ x: touch.clientX, y: touch.clientY });
+      updateCursorStyle(touch.clientX, touch.clientY, isDwellActive);
     }
   };
 
@@ -372,25 +411,43 @@ export default function HandTracker({
     const dotX = dotRef.current.x;
     const dotY = dotRef.current.y;
     
-    // Find client bounding rectangles of active matching choice cards
-    const cards = document.querySelectorAll('.phonics-match-choice');
-    let intersectingIndex: number | null = null;
-
-    cards.forEach((card) => {
-      const indexAttr = card.getAttribute('data-choice-index');
-      if (indexAttr === null) return;
-      const index = parseInt(indexAttr, 10);
-      
-      const rect = card.getBoundingClientRect();
-      if (
-        dotX >= rect.left &&
-        dotX <= rect.right &&
-        dotY >= rect.top &&
-        dotY <= rect.bottom
-      ) {
-         intersectingIndex = index;
+    // Find client bounding rectangles of active matching choice cards (cached to prevent forced synchronous layouts)
+    if (cardRectsRef.current.length === 0) {
+      const cards = document.querySelectorAll('.phonics-match-choice');
+      const tempRects: typeof cardRectsRef.current = [];
+      cards.forEach((card) => {
+        const indexAttr = card.getAttribute('data-choice-index');
+        if (indexAttr === null) return;
+        const index = parseInt(indexAttr, 10);
+        
+        const rect = card.getBoundingClientRect();
+        tempRects.push({
+          left: rect.left + window.scrollX,
+          right: rect.right + window.scrollX,
+          top: rect.top + window.scrollY,
+          bottom: rect.bottom + window.scrollY,
+          index,
+        });
+      });
+      if (tempRects.length > 0) {
+        cardRectsRef.current = tempRects;
       }
-    });
+    }
+
+    let intersectingIndex: number | null = null;
+    const cached = cardRectsRef.current;
+    for (let i = 0; i < cached.length; i++) {
+      const { left, right, top, bottom, index } = cached[i];
+      if (
+        dotX >= left &&
+        dotX <= right &&
+        dotY >= top &&
+        dotY <= bottom
+      ) {
+        intersectingIndex = index;
+        break;
+      }
+    }
 
     if (intersectingIndex !== null) {
       if (currentHoveredIndexRef.current !== intersectingIndex) {
@@ -414,6 +471,13 @@ export default function HandTracker({
 
         lastDwellProgressRef.current = pct;
         setDwellProgress(pct);
+
+        if (progressRingRef.current) {
+          const r = 18;
+          const circumference = 2 * Math.PI * r;
+          const offset = circumference * (1 - pct / 100);
+          progressRingRef.current.style.strokeDashoffset = `${offset}`;
+        }
 
         if (elapsed >= DWELL_DURATION) {
           // Trigger Selection Event
@@ -465,14 +529,18 @@ export default function HandTracker({
 
       {/* Floating Orange Cursor Overlay spanning absolute Screen Viewport */}
       <div className="fixed inset-0 pointer-events-none z-50 overflow-hidden">
-        <motion.div
-          animate={{
-            x: dotPos.x - 20,
-            y: dotPos.y - 20,
-            scale: isDwellActive ? [1, 1.25, 1.15] : 1,
+        <div
+          ref={cursorRef}
+          className="absolute w-10 h-10 flex items-center justify-center pointer-events-none transition-transform duration-100 ease-out"
+          style={{
+            position: 'absolute',
+            left: 0,
+            top: 0,
+            width: '40px',
+            height: '40px',
+            willChange: 'transform',
+            transform: `translate3d(${dotRef.current.x - 20}px, ${dotRef.current.y - 20}px, 0) scale(${isDwellActive ? 1.15 : 1})`,
           }}
-          transition={{ duration: 0.12, ease: 'easeOut' }}
-          className="absolute w-10 h-10 flex items-center justify-center pointer-events-none"
         >
           {/* Terracotta/Orange Glowing pointer dot from theme palette */}
           <div className="relative w-5 h-5 rounded-full bg-[#e07a5f] shadow-[0_0_15px_rgba(224,122,95,0.75)] border-2 border-white flex items-center justify-center">
@@ -492,7 +560,8 @@ export default function HandTracker({
                 strokeWidth="3"
                 fill="transparent"
               />
-              <motion.circle
+              <circle
+                ref={progressRingRef}
                 cx="24"
                 cy="24"
                 r="18"
@@ -500,8 +569,8 @@ export default function HandTracker({
                 strokeWidth="4"
                 fill="transparent"
                 strokeDasharray={2 * Math.PI * 18}
-                strokeDashoffset={2 * Math.PI * 18 * (1 - dwellProgress / 100)}
-                transition={{ duration: 0.05 }}
+                strokeDashoffset={2 * Math.PI * 18 * (1 - lastDwellProgressRef.current / 100)}
+                style={{ transition: 'stroke-dashoffset 0.05s ease-out' }}
               />
             </svg>
           )}
@@ -512,7 +581,7 @@ export default function HandTracker({
               <Sparkles className="w-5 h-5 fill-current" />
             </div>
           )}
-        </motion.div>
+        </div>
       </div>
 
       {/* Tracker Menu Panel Header */}
@@ -562,6 +631,11 @@ export default function HandTracker({
             <span className="text-[8px] uppercase font-bold tracking-wider leading-none">Hover Mode</span>
           </button>
         </div>
+
+        {/* Device performance guide notice */}
+        <div className="text-[9px] text-[#3d405b]/85 leading-normal bg-white/60 p-2 rounded-xl border border-[#3d405b]/5 text-center mt-0.5 shadow-sm">
+          💡 <strong>iPad 6th Gen or older?</strong> Slide or drag inside <strong>Hover Mode</strong> for ultra-smooth rendering!
+        </div>
       </div>
 
       {/* Camera Live Feed / Canvas Viewbox preview display */}
@@ -596,7 +670,7 @@ export default function HandTracker({
               <div className="absolute inset-0 bg-[#3d405b]/95 flex flex-col items-center justify-center p-4 text-center pointer-events-none">
                 <RefreshCw className="w-7 h-7 text-[#e07a5f] animate-spin mb-2" />
                 <span className="text-xs font-bold text-[#e07a5f] uppercase tracking-widest animate-pulse">Initializing Finger AI</span>
-                <span className="text-[10px] text-[#f4f1de]/80 mt-1">Downloading tracking models...</span>
+                <span className="text-[10px] text-[#f4f1de]/80 mt-1">Downloading ultra-portable tracking models...</span>
               </div>
             )}
           </div>

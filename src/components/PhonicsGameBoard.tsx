@@ -48,9 +48,9 @@ export default function PhonicsGameBoard() {
   const [isAutoAdvancing, setIsAutoAdvancing] = useState(false);
   const [advanceSecondsLeft, setAdvanceSecondsLeft] = useState(0);
 
-  // Web camera sensor options
-  const [cameraActive, setCameraActive] = useState(true);
-  const [trackingMode, setTrackingMode] = useState<'finger' | 'touch'>('finger');
+  // Web camera sensor options - Default to off/touch for instant load and flawless performance on older iPads
+  const [cameraActive, setCameraActive] = useState(false);
+  const [trackingMode, setTrackingMode] = useState<'finger' | 'touch'>('touch');
 
   // Ref to hold the active timeout for clearing incorrect selections
   const incorrectTimeoutRef = useRef<NodeJS.Timeout | null>(null);
