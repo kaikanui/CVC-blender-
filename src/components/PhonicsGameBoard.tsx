@@ -12,7 +12,6 @@ import {
 import { WordItem, GameLevel } from '../types.ts';
 import { generateQuestion } from '../data.ts';
 import { audio } from './AudioPlayer.ts';
-import HandTracker from './HandTracker.tsx';
 
 // Montessori and Orton-Gillingham sounding blocks styled with authentic Natural Tones
 const PHONEME_STYLING = {
@@ -48,9 +47,18 @@ export default function PhonicsGameBoard() {
   const [isAutoAdvancing, setIsAutoAdvancing] = useState(false);
   const [advanceSecondsLeft, setAdvanceSecondsLeft] = useState(0);
 
-  // Web camera sensor options - Default to off/touch for instant load and flawless performance on older iPads
-  const [cameraActive, setCameraActive] = useState(false);
-  const [trackingMode, setTrackingMode] = useState<'finger' | 'touch'>('touch');
+  // Hover & Dwell matching state
+  const [isDwellActive, setIsDwellActive] = useState(false);
+  const [hoveredCardIdx, setHoveredCardIdx] = useState<number | null>(null);
+  const [showCursor, setShowCursor] = useState(false);
+
+  const hoverStartTimeRef = useRef<number | null>(null);
+  const lastDwellProgressRef = useRef(0);
+  const activeDwellIndexRef = useRef<number | null>(null);
+  const animationFrameRef = useRef<number | null>(null);
+  const cursorRef = useRef<HTMLDivElement | null>(null);
+  const progressRingRef = useRef<SVGCircleElement | null>(null);
+  const cardRectsRef = useRef<{ left: number; right: number; top: number; bottom: number; index: number }[]>([]);
 
   // Ref to hold the active timeout for clearing incorrect selections
   const incorrectTimeoutRef = useRef<NodeJS.Timeout | null>(null);
@@ -63,6 +71,170 @@ export default function PhonicsGameBoard() {
       }
     };
   }, []);
+
+  // Unified pointer tracker (mouse move or iPad finger slide dragging)
+  const handlePointerMove = (e: React.PointerEvent) => {
+    if (!showCursor) {
+      setShowCursor(true);
+    }
+
+    if (cursorRef.current && !isAutoAdvancing && matchState !== 'correct') {
+      cursorRef.current.style.transform = `translate3d(${e.clientX - 20}px, ${e.clientY - 20}px, 0)`;
+    }
+
+    checkCollisions(e.clientX, e.clientY);
+  };
+
+  const handlePointerLeave = () => {
+    setShowCursor(false);
+    resetDwell();
+  };
+
+  const handlePointerDown = (e: React.PointerEvent) => {
+    if (cursorRef.current) {
+      cursorRef.current.style.transform = `translate3d(${e.clientX - 20}px, ${e.clientY - 20}px, 0)`;
+      setShowCursor(true);
+    }
+    checkCollisions(e.clientX, e.clientY);
+  };
+
+  // Reset rects cache and dwell state on slide off or completed actions
+  const resetDwell = () => {
+    if (animationFrameRef.current) {
+      cancelAnimationFrame(animationFrameRef.current);
+      animationFrameRef.current = null;
+    }
+    activeDwellIndexRef.current = null;
+    hoverStartTimeRef.current = null;
+    lastDwellProgressRef.current = 0;
+    setHoveredCardIdx(null);
+    setIsDwellActive(false);
+
+    if (progressRingRef.current) {
+      const r = 18;
+      const circumference = 2 * Math.PI * r;
+      progressRingRef.current.style.strokeDashoffset = `${circumference}`;
+    }
+  };
+
+  const checkCollisions = (x: number, y: number) => {
+    if (matchState === 'correct' || isAutoAdvancing) {
+      resetDwell();
+      return;
+    }
+
+    // Capture bounding rects of choices on-demand and cache them
+    if (cardRectsRef.current.length === 0) {
+      const cards = document.querySelectorAll('.phonics-match-choice');
+      const tempRects: { left: number; right: number; top: number; bottom: number; index: number }[] = [];
+      cards.forEach((card) => {
+        const indexAttr = card.getAttribute('data-choice-index');
+        if (indexAttr === null) return;
+        const index = parseInt(indexAttr, 10);
+        const rect = card.getBoundingClientRect();
+        tempRects.push({
+          left: rect.left,
+          right: rect.right,
+          top: rect.top,
+          bottom: rect.bottom,
+          index,
+        });
+      });
+      if (tempRects.length > 0) {
+        cardRectsRef.current = tempRects;
+      }
+    }
+
+    let intersectedIndex: number | null = null;
+    const rects = cardRectsRef.current;
+    for (let i = 0; i < rects.length; i++) {
+      const r = rects[i];
+      if (x >= r.left && x <= r.right && y >= r.top && y <= r.bottom) {
+        intersectedIndex = r.index;
+        break;
+      }
+    }
+
+    if (intersectedIndex !== null) {
+      if (activeDwellIndexRef.current !== intersectedIndex) {
+        // Entered a different choice card, restart timing
+        activeDwellIndexRef.current = intersectedIndex;
+        hoverStartTimeRef.current = performance.now();
+        setHoveredCardIdx(intersectedIndex);
+        setIsDwellActive(true);
+        lastDwellProgressRef.current = 0;
+        audio.playTick();
+
+        if (animationFrameRef.current) {
+          cancelAnimationFrame(animationFrameRef.current);
+        }
+        animationFrameRef.current = requestAnimationFrame(updateDwellProgress);
+      }
+    } else {
+      resetDwell();
+    }
+  };
+
+  const DWELL_DURATION = 1200; // 1.2s hover hold selects beautifully
+
+  const updateDwellProgress = () => {
+    if (activeDwellIndexRef.current === null || !hoverStartTimeRef.current) {
+      resetDwell();
+      return;
+    }
+
+    const elapsed = performance.now() - hoverStartTimeRef.current;
+    const progress = Math.min(100, (elapsed / DWELL_DURATION) * 100);
+
+    // Audio-visual ticking feedback
+    if (Math.floor(progress / 20) > Math.floor(lastDwellProgressRef.current / 20)) {
+      audio.playTick();
+    }
+    lastDwellProgressRef.current = progress;
+
+    if (progressRingRef.current) {
+      const r = 18;
+      const circumference = 2 * Math.PI * r;
+      const offset = circumference * (1 - progress / 100);
+      progressRingRef.current.style.strokeDashoffset = `${offset}`;
+    }
+
+    if (elapsed >= DWELL_DURATION) {
+      const targetChoiceIdx = activeDwellIndexRef.current;
+      resetDwell();
+      handleSelectChoice(targetChoiceIdx);
+      audio.playPop();
+    } else {
+      animationFrameRef.current = requestAnimationFrame(updateDwellProgress);
+    }
+  };
+
+  // Reset rects cache and dwells when question or difficulty limits change
+  useEffect(() => {
+    cardRectsRef.current = [];
+    resetDwell();
+  }, [question, level]);
+
+  // Handle browser viewport sizing revisions
+  useEffect(() => {
+    const handleResize = () => {
+      cardRectsRef.current = [];
+    };
+    window.addEventListener('resize', handleResize);
+    return () => {
+      window.removeEventListener('resize', handleResize);
+      if (animationFrameRef.current) {
+        cancelAnimationFrame(animationFrameRef.current);
+      }
+    };
+  }, []);
+
+  // Lock dwells instantly on success
+  useEffect(() => {
+    if (matchState === 'correct') {
+      resetDwell();
+    }
+  }, [matchState]);
 
   // Trigger loading next question loop
   useEffect(() => {
@@ -195,7 +367,13 @@ export default function PhonicsGameBoard() {
   }, [isAutoAdvancing, advanceSecondsLeft]);
 
   return (
-    <div id="phonics-main-layout" className="w-full h-full flex flex-col text-[#3d405b] font-sans bg-[#fdfcf0] transition-colors duration-300 overflow-hidden">
+    <div 
+      id="phonics-main-layout" 
+      className="w-full h-full flex flex-col text-[#3d405b] font-sans bg-[#fdfcf0] transition-colors duration-300 overflow-hidden relative touch-none cursor-default select-none"
+      onPointerMove={handlePointerMove}
+      onPointerDown={handlePointerDown}
+      onPointerLeave={handlePointerLeave}
+    >
       
       {/* Natural Tones Top Navigation Header */}
       <header className="bg-[#f4f1de] border-b border-[#e07a5f]/20 px-6 py-3 flex flex-row items-center justify-between gap-4 shadow-sm shrink-0">
@@ -265,25 +443,9 @@ export default function PhonicsGameBoard() {
         </div>
       </header>
 
-      {/* Main Core Layout Bento Grid */}
-      <main className="w-full flex-1 min-h-0 px-6 py-4 grid grid-cols-1 md:grid-cols-12 gap-5 overflow-hidden">
-        
-        {/* LEFT COLUMN: Camera Sensor */}
-        <section className="md:col-span-4 flex flex-col gap-4 min-h-0">
-          {/* PHYSICAL CAMERA TRACKER CONTAINER */}
-          <HandTracker
-            onSelectChoice={handleSelectChoice}
-            choicesCount={question?.choices?.length || 4}
-            isCorrect={matchState === 'correct'}
-            cameraActive={cameraActive}
-            setCameraActive={setCameraActive}
-            trackingMode={trackingMode}
-            setTrackingMode={setTrackingMode}
-          />
-        </section>
-
-        {/* RIGHT COLUMN: Natural Tones Big Interactive Play Board */}
-        <section className="md:col-span-8 flex flex-col gap-4 items-stretch justify-start min-h-0">
+      {/* Main Core Layout - Widened Display perfect for 6th Gen iPad Landscape */}
+      <main className="w-full flex-1 min-h-0 px-6 md:px-12 py-5 flex flex-col justify-between overflow-hidden relative">
+        <section className="w-full flex flex-col gap-4 items-stretch justify-start min-h-0 flex-1">
           
           {/* THE GIANT TARGET WORD SCREEN AT THE TOP - BEAUTIFUL SAGE EXTRA BOARD BORDER */}
           <div id="target-word-display" className="bg-white px-6 py-4 rounded-3xl shadow-sm border-4 border-[#81b29a] text-center flex flex-col items-center justify-center gap-4 relative overflow-hidden flex-1 min-h-[11rem]">
@@ -381,7 +543,7 @@ export default function PhonicsGameBoard() {
                 >
                   <div className="flex items-center gap-1.5 text-[10px] font-bold">
                     <HelpCircle className="w-3.5 h-3.5 text-[#e07a5f] shrink-0" />
-                    <span>Point with hand camera, or hover choice card to select!</span>
+                    <span>Slide over any card to hover & select, or tap to match!</span>
                   </div>
                   {question?.target.category === 'heart' && (
                     <span className="bg-[#e07a5f]/10 text-[#e07a5f] font-extrabold text-[8px] px-2 py-0.5 rounded-full uppercase tracking-wider">
@@ -396,11 +558,12 @@ export default function PhonicsGameBoard() {
           {/* IMAGES GRID MATCH SPACES WITH NATURAL BUBBLE CLUE CIRCLES */}
           <div 
             id="phonics-images-match-grid" 
-            className="grid grid-cols-2 gap-3 shrink-0"
+            className="grid grid-cols-2 gap-3.5 shrink-0"
           >
             {question ? (
               question.choices.map((choice, index) => {
                 const isSelected = selectedIdx === index;
+                const isHovered = hoveredCardIdx === index;
                 
                 // Beautiful Natural Tones matching configurations
                 let borderStyle = 'border-transparent hover:border-[#81b29a]';
@@ -414,6 +577,9 @@ export default function PhonicsGameBoard() {
                     borderStyle = 'border-[#e07a5f] ring-2 ring-[#e07a5f]/20 animate-wiggle';
                     backgroundStyle = 'bg-[#e07a5f]/5';
                   }
+                } else if (isHovered) {
+                  borderStyle = 'border-[#e07a5f] ring-2 ring-[#e07a5f]/10 scale-[1.01]';
+                  backgroundStyle = 'bg-[#fdfcf0]/50';
                 }
 
                 // Friendly graphic bubbles in Natural Tones: f2cc8f, e9edc9, 81b29a, e07a5f
@@ -432,12 +598,12 @@ export default function PhonicsGameBoard() {
                     onClick={() => handleSelectChoice(index)}
                     whileHover={{ y: -1 }}
                     whileTap={{ scale: 0.99 }}
-                    className={`phonics-match-choice group relative flex flex-col items-center justify-center p-2.5 border-2 rounded-2xl cursor-pointer text-center select-none shadow-sm transition-all duration-150 h-28 md:h-32 ${borderStyle} ${backgroundStyle}`}
+                    className={`phonics-match-choice group relative flex flex-col items-center justify-center p-3.5 border-2 rounded-2xl cursor-pointer text-center select-none shadow-sm transition-all duration-150 h-32 md:h-36 ${borderStyle} ${backgroundStyle}`}
                   >
                     {/* Natural Tone Bubble behind choice emoji */}
-                    <div className={`w-14 h-14 rounded-full flex items-center justify-center transition-transform group-hover:scale-105 ${bubbleColor} shrink-0`}>
+                    <div className={`w-16 h-16 rounded-full flex items-center justify-center transition-transform group-hover:scale-105 ${bubbleColor} shrink-0`}>
                       <span 
-                        className="text-4xl select-none filter drop-shadow-sm pointer-events-none"
+                        className="text-5xl select-none filter drop-shadow-sm pointer-events-none"
                         style={{ contentVisibility: 'auto' }}
                       >
                         {choice.emoji}
@@ -506,6 +672,58 @@ export default function PhonicsGameBoard() {
           Phonics matching game styled using Natural Tones supporting Orton-Gillingham learning.
         </p>
       </footer>
+
+      {/* Floating Orange Cursor Overlay spanning absolute Screen Viewport */}
+      {showCursor && (
+        <div className="fixed inset-0 pointer-events-none z-50 overflow-hidden">
+          <div
+            ref={cursorRef}
+            className="absolute w-10 h-10 flex items-center justify-center pointer-events-none transition-transform duration-75 ease-out"
+            style={{
+              position: 'absolute',
+              left: 0,
+              top: 0,
+              width: '40px',
+              height: '40px',
+              willChange: 'transform',
+              transform: 'translate3d(-100px, -100px, 0)',
+            }}
+          >
+            {/* Terracotta/Orange Glowing pointer dot from theme palette */}
+            <div className="relative w-5 h-5 rounded-full bg-[#e07a5f] shadow-[0_0_15px_rgba(224,122,95,0.75)] border-2 border-white flex items-center justify-center">
+              {isDwellActive && (
+                <div className="absolute inset-0 rounded-full border-2 border-white animate-ping opacity-60" />
+              )}
+            </div>
+
+            {/* Glowing loader ring around pointer tracking progress */}
+            {isDwellActive && (
+              <svg className="absolute w-12 h-12 -rotate-90">
+                <circle
+                  cx="24"
+                  cy="24"
+                  r="18"
+                  stroke="rgba(224, 122, 95, 0.25)"
+                  strokeWidth="3"
+                  fill="transparent"
+                />
+                <circle
+                  ref={progressRingRef}
+                  cx="24"
+                  cy="24"
+                  r="18"
+                  stroke="#e07a5f"
+                  strokeWidth="4"
+                  fill="transparent"
+                  strokeDasharray={2 * Math.PI * 18}
+                  strokeDashoffset={2 * Math.PI * 18}
+                  style={{ transition: 'stroke-dashoffset 0.05s ease-out' }}
+                />
+              </svg>
+            )}
+          </div>
+        </div>
+      )}
     </div>
   );
 }
